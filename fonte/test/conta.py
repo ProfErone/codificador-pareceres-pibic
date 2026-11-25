@@ -1,0 +1,97 @@
+import os, pathlib
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+CHROME = os.environ.get("CHROME", "/usr/bin/google-chrome")
+import asyncio, json, base64, io, zipfile, sys
+from playwright.async_api import async_playwright
+URL = RAIZ.joinpath("dist","index.html").as_uri()
+MOCK = RAIZ.joinpath("test","mock.js").read_text(encoding="utf-8")
+OK = []; FAIL = []
+def check(nome, cond, extra=""):
+    (OK if cond else FAIL).append(nome); print(("  ok   " if cond else "  FALHA ") + nome + (f"  [{extra}]" if extra and not cond else ""))
+async def main():
+    async with async_playwright() as p:
+        b = await p.chromium.launch(executable_path=CHROME)
+        ctx = await b.new_context(viewport={"width": 1440, "height": 900}); await ctx.add_init_script(MOCK)
+        pg = await ctx.new_page(); errs = []; pg.on("pageerror", lambda e: errs.append(str(e)))
+        await pg.goto(URL); await pg.wait_for_timeout(900)
+        print("== A. conta")
+        r = await pg.evaluate("() => ({modo: store.modo, txt: document.querySelector('#guarda').textContent, docs: Object.keys(JSON.parse(localStorage.getItem('__mockdb'))).length, temIA: S.temIA})")
+        check("modo conta", r["modo"] == "conta" and "na sua conta" in r["txt"], str(r))
+        check("meta e exemplo gravados na conta", r["docs"] == 2, str(r["docs"]))
+        check("segunda leitura por IA disponível", r["temIA"] is True)
+        # cria e finaliza um parecer rapidamente por código
+        await pg.evaluate("""async () => { const p = novoParecer('P01'); Object.assign(p.identificacao, {tipo_instituicao:'EMEB', semestre:'2026/2', idade:'5', imigracao:'Nao', anonimizado:true});
+          p.texto_parecer = 'No parque, tem corrido com os colegas desde o início do ano. É uma criança difícil.';
+          const a = novoExcerto(0, 60, p.texto_parecer.slice(0, 60)); Object.assign(a, {dimensao_dominante:'DMF', marcas:['M1','M2','M4']});
+          const c = novoExcerto(61, 84, p.texto_parecer.slice(61, 84)); Object.assign(c, {dimensao_dominante:'DMS', marcas:['M5']});
+          p.excertos.push(a, c); p.fechamento.excerto_representativo = a.k; p.fechamento.sintese_uma_frase = 'Síntese.'; S.P[p.key] = p; await store.gravarJa(p); await finalizar(p); desenhar(); }""")
+        await pg.wait_for_timeout(200)
+        r = await pg.evaluate("() => { const db = JSON.parse(localStorage.getItem('__mockdb')); const k = Object.keys(db).find(x => db[x].id_registro === 'REG-0001'); return {reg: !!k, compacto: k && !db[k].excertos && !!db[k].registro, meta: db['data/users/u_teste/meta'], caminho: k} }")
+        check("finalizado gravado na conta em forma compacta", r["reg"] and r["compacto"], str(r))
+        check("contador na conta", r["meta"]["contador"] == 1 and r["meta"]["modelo"] == 4, str(r["meta"]))
+        check("caminho privado por usuário", r["caminho"].startswith("data/users/u_teste/meta/pareceres/"), r["caminho"])
+        # apaga a cópia local: os dados devem voltar da conta
+        await pg.evaluate("() => { Object.keys(localStorage).filter(k => k.startsWith('pibic:')).forEach(k => localStorage.removeItem(k)); }")
+        await pg.reload(); await pg.wait_for_timeout(900)
+        r = await pg.evaluate("async () => { const f = finalizados()[0]; return {n: todos().length, reg: f && f.id_registro, ex: f && f.excertos.length, ok: f && await integro(f.registro), cont: S.meta.contador, ls: Object.keys(localStorage).filter(k => k.startsWith('pibic:p:')).length} }")
+        check("dados voltam da conta sem cópia local", r["n"] == 2 and r["reg"] == "REG-0001" and r["ex"] == 2 and r["ok"] is True and r["cont"] == 1, str(r))
+        check("cópia local refeita", r["ls"] == 2)
+        print("== B. downloads")
+        await pg.click('.item:has-text("P01")'); await pg.wait_for_timeout(100)
+        await pg.click('[data-act="baixar-json"]'); await pg.wait_for_timeout(200)
+        await pg.click('[data-act="zip"]'); await pg.click('[data-act="zip-ok"]'); await pg.wait_for_timeout(500)
+        await pg.click('[data-act="backup"]'); await pg.wait_for_timeout(300)
+        files = await pg.evaluate("() => window.__files")
+        nomes = [f["filename"] for f in files]
+        check("três arquivos entregues", len(files) == 3 and nomes[0] == "REG-0001_P01_v1.json" and nomes[1].startswith("PIBIC_pareceres_") and nomes[1].endswith("_1de60.zip") and nomes[2].startswith("BACKUP_pibic_"), str(nomes))
+        j = json.loads(base64.b64decode(files[0]["b64"]).decode("utf-8"))
+        check("JSON baixado é o registro selado", j["id_registro"] == "REG-0001" and j["schema"] == "pibic-pareceres/2.0" and "integridade" in j and j["excertos"][0]["nivel_registro"] == "Lastro")
+        zf = zipfile.ZipFile(io.BytesIO(base64.b64decode(files[1]["b64"])))
+        nl = zf.namelist()
+        check("ZIP íntegro e completo", zf.testzip() is None and nl == ["LEIA-ME.txt", "manifesto.json", "pareceres/REG-0001_P01_v1.json", "consolidado/excertos.csv", "consolidado/pareceres.csv", "consolidado/ausencias.csv", "fichas/P01.md"], str(nl))
+        check("JSON do ZIP igual ao baixado", json.loads(zf.read("pareceres/REG-0001_P01_v1.json")) == j)
+        pc = zf.read("consolidado/pareceres.csv").decode("utf-8-sig").split("\r\n")
+        cab = pc[0].replace('"', "").split(";"); lin = dict(zip(cab, [c.strip('"') for c in pc[1].split('";"')]))
+        check("pareceres.csv: presenças 0/1 e contagens", lin["DMF"] == "1" and lin["DMC"] == "0" and lin["N_Sem_Lastro"] == "1" and lin["N_Lastro"] == "1" and lin["N_Rotulo_M5"] == "1" and lin["Nivel_Registro_Predominante"] == "Equilibrio", str({k: lin[k] for k in ["DMF", "DMC", "N_Sem_Lastro", "N_Lastro"]}))
+        check("json_baixado marcado", await pg.evaluate("() => finalizados()[0].json_baixado === true"))
+        print("== C. segunda leitura por IA")
+        await pg.click('.vistas a[href="#concordancia"]'); await pg.wait_for_timeout(150)
+        await pg.select_option("#concP", index=0); await pg.wait_for_timeout(100)
+        check("botão de IA visível", await pg.is_visible('[data-act="ia-pedir"]'))
+        await pg.click('[data-act="ia-pedir"]'); await pg.click('[data-act="ia-ok"]'); await pg.wait_for_timeout(400)
+        r = await pg.evaluate("() => { const p = S.P[S.conc.chave], l = p.segunda_leitura, x = S.conc.res; return {cod: p.identificacao.codigo_parecer, n: Object.keys(l.excertos).length, e1: l.excertos[p.excertos[0].k], pares: x.pares, dim: x.principais[0].iguais, prompt: window.__prompt.includes('TRECHOS A CODIFICAR') && window.__prompt.includes('«No parque') && window.__prompt.includes('DMF (Física/motora)'), origem: x.origem} }")
+        check("leitura recebida, validada e comparada", r["cod"] == "P01" and r["n"] == 2 and r["pares"] == 2 and r["e1"]["marcas"] == ["M1", "M4"] and r["e1"]["direitos"] == ["DExpr"], str(r))
+        check("prompt traz livro de códigos e trechos", r["prompt"])
+        check("registro selado não mudou com a leitura", await pg.evaluate("async () => await integro(finalizados()[0].registro)") is True)
+        await pg.evaluate("() => localStorage.setItem('__flag_iaerro', '1')")
+        await pg.click('[data-act="ia-pedir"]'); await pg.click('[data-act="ia-ok"]'); await pg.wait_for_timeout(300)
+        check("erro de limite tratado", "Limite de uso" in await pg.inner_text("#avisoRaiz"))
+        await pg.evaluate("() => localStorage.removeItem('__flag_iaerro')")
+        print("== D. dois aparelhos")
+        # outro aparelho finalizou mais pareceres: o contador da conta avançou
+        await pg.evaluate("""() => { const db = JSON.parse(localStorage.getItem('__mockdb')); db['data/users/u_teste/meta'].contador = 7;
+          db['data/users/u_teste/meta/pareceres/kremoto'] = {key:'kremoto', modelo:4, status:'rascunho', demo:false, versao:1, id_registro:null, substitui:null, identificacao:{codigo_parecer:'P30', tipo_instituicao:'', semestre:'', idade:'', imigracao:'', anonimizado:false}, texto_parecer:'', excertos:[], fechamento:{excerto_representativo:'', sintese_uma_frase:'', observacoes_gerais:'', observacoes_ausencia:''}, criado_em:new Date().toISOString(), atualizado_em:new Date().toISOString(), finalizado_em:null};
+          localStorage.setItem('__mockdb', JSON.stringify(db)); }""")
+        await pg.evaluate("async () => await store.ressincronizar()"); await pg.wait_for_timeout(200)
+        r = await pg.evaluate("async () => ({tem: todos().some(p => p.identificacao.codigo_parecer === 'P30'), cont: S.meta.contador, prox: await store.proximoNumero()})")
+        check("rascunho de outro aparelho aparece", r["tem"])
+        check("próximo número respeita o outro aparelho", r["cont"] == 7 and r["prox"] == 8, str(r))
+        print("== E. sem permissão de escrita e sem identidade")
+        ctx2 = await b.new_context(); await ctx2.add_init_script("localStorage.setItem('__flag_ro','1');" + MOCK); pg2 = await ctx2.new_page(); pg2.on("pageerror", lambda e: errs.append("ro " + str(e)))
+        await pg2.goto(URL); await pg2.wait_for_timeout(900)
+        r = await pg2.evaluate("() => ({modo: store.modo, txt: document.querySelector('#guarda').textContent, n: todos().length})")
+        check("somente leitura: cai para o navegador", r["modo"] == "local" and "neste navegador" in r["txt"] and r["n"] == 1, str(r))
+        ctx3 = await b.new_context(); await ctx3.add_init_script("localStorage.setItem('__flag_semid','1');localStorage.setItem('__flag_sem_sample','1');localStorage.setItem('__flag_recusa','1');" + MOCK); pg3 = await ctx3.new_page(); pg3.on("pageerror", lambda e: errs.append("semid " + str(e)))
+        await pg3.goto(URL); await pg3.wait_for_timeout(900)
+        r = await pg3.evaluate("() => ({modo: store.modo, temIA: S.temIA})")
+        check("sem identidade: modo local; sem IA: recurso oculto", r["modo"] == "local" and r["temIA"] is False, str(r))
+        await pg3.click('.vistas a[href="#concordancia"]'); await pg3.wait_for_timeout(150)
+        check("botão de IA escondido", not await pg3.is_visible('[data-act="ia-pedir"]'))
+        await pg3.click('.vistas a[href="#pareceres"]'); await pg3.wait_for_timeout(100)
+        await pg3.evaluate("async () => { const p = atual(); await baixarJson(p); }"); await pg3.wait_for_timeout(200)
+        check("download recusado pela pessoa: só avisa", "cancelado" in (await pg3.inner_text("#avisoRaiz")).lower() and not await pg3.is_visible("#copiaTxt"))
+        check("nenhum erro de página", not errs, str(errs[:3]))
+        await b.close()
+    print(f"\n{len(OK)} ok, {len(FAIL)} falhas")
+    if FAIL: print("FALHAS:", FAIL); sys.exit(1)
+asyncio.run(main())
