@@ -21,3 +21,4 @@ Instrumento de codificação da pesquisa "Dimensões do desenvolvimento infantil
 - Segunda leitura por IA, na página Concordância.
 
 Material sobre crianças: cole no Codificador só texto anonimizado.
+
